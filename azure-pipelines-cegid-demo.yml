@@ -1,0 +1,142 @@
+pr:
+  branches:
+    include:
+      - dev
+  paths:
+    exclude:
+      - docs/*
+      - README.md
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  Prefix: 'fayaz'
+  BuildConfiguration: 'release'
+  ArtifactStagingDirectory: '$(Build.ArtifactStagingDirectory)'
+  AzureSubscription: 'AzureSubscriptionConnection(25a98a18-5e94-4b21-9d17-e8cf45bfd81f)'
+  WebAppName: '$(Prefix)-demo-webapp'
+  ResourceGroupName: '$(Prefix)-resource-group'
+  SlotName: 'staging'
+  PackagePath: '$(ArtifactStagingDirectory)/WebApp.zip'
+
+stages:
+  - stage: Build_Stage
+    displayName: Build Stage
+    jobs:
+      - job: Build_WebApp
+        displayName: Build and Test Web Application
+        pool:
+          vmImage: 'windows-2019'
+          demands: java
+        steps:
+        - task: DotNetCoreCLI@2
+          displayName: Restore Dependencies
+          inputs:
+            command: restore
+            projects: '**/WebApp/WebApp.csproj'
+
+        - task: DotNetCoreCLI@2
+          displayName: Build Application
+          inputs:
+            command: build
+            projects: '**/WebApp/WebApp.csproj'
+            arguments: '--configuration $(BuildConfiguration)'
+
+        - task: DotNetCoreCLI@2
+          displayName: Run Unit Tests
+          inputs:
+            command: test
+            projects: '**/*UnitTest*.csproj'
+            arguments: '--configuration $(BuildConfiguration)'
+
+        - task: DotNetCoreCLI@2
+          displayName: Publish Application
+          inputs:
+            command: publish
+            publishWebProjects: true
+            arguments: '--configuration $(BuildConfiguration) --output $(ArtifactStagingDirectory)'
+            zipAfterPublish: true
+
+        - task: PublishBuildArtifacts@1
+          displayName: Publish WebApp Artifact
+          inputs:
+            PathtoPublish: '$(ArtifactStagingDirectory)'
+            ArtifactName: 'WebApp'
+
+  - stage: Deploy_Stage
+    displayName: Deploy Stage
+    dependsOn: Build_Stage
+    jobs:
+      - job: Deploy_WebApp
+        displayName: Deploy Web Application to Azure
+        pool:
+          vmImage: 'windows-2019'
+        steps:
+        - task: DownloadBuildArtifacts@0
+          displayName: Download Build Artifacts
+          inputs:
+            artifactName: 'WebApp'
+            downloadPath: '$(System.DefaultWorkingDirectory)'
+
+        - task: AzureRmWebAppDeployment@4
+          displayName: Deploy Web App to Staging Slot
+          inputs:
+            ConnectionType: AzureRM
+            azureSubscription: $(AzureSubscription)
+            appType: webAppLinux
+            WebAppName: $(WebAppName)
+            deployToSlotOrASE: true
+            ResourceGroupName: $(ResourceGroupName)
+            SlotName: $(SlotName)
+            packageForLinux: $(PackagePath)
+
+  - stage: Swap_Slot_Stage
+    displayName: Swap Staging to Production
+    dependsOn: Deploy_Stage
+    jobs:
+      - job: Swap_Slots
+        displayName: Swap Slots for Zero-Downtime Deployment
+        pool:
+          vmImage: 'windows-2019'
+        steps:
+        - task: AzureRmWebAppDeployment@4
+          displayName: Swap Staging Slot to Production
+          inputs:
+            ConnectionType: AzureRM
+            azureSubscription: $(AzureSubscription)
+            appType: webAppLinux
+            WebAppName: $(WebAppName)
+            ResourceGroupName: $(ResourceGroupName)
+            Action: SwapSlots
+            SourceSlot: $(SlotName)
+            TargetSlot: 'production'
+
+  - stage: Post_Deployment_Validation
+    displayName: Post-Deployment Validation
+    dependsOn: Swap_Slot_Stage
+    jobs:
+      - job: Validate_Deployment
+        displayName: Validate Production Deployment
+        pool:
+          vmImage: 'windows-2019'
+        steps:
+        - task: PowerShell@2
+          displayName: Validate Web App Availability
+          inputs:
+            targetType: 'inline'
+            script: |
+              $url = "https://$(WebAppName).azurewebsites.net"
+              Write-Host "Validating Web App URL: $url"
+              try {
+                $response = Invoke-WebRequest -Uri $url -UseBasicParsing
+                if ($response.StatusCode -eq 200) {
+                  Write-Host "Web App is available and responding."
+                } else {
+                  Write-Error "Web App validation failed with status code: $($response.StatusCode)"
+                }
+              } catch {
+                Write-Error "Failed to reach Web App URL."
+              }

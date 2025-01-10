@@ -1,0 +1,245 @@
+trigger:
+  branches:
+    include:
+      - master
+  paths:
+    exclude:
+      - docs/*
+      - README.md
+      - azure-pipelines-ci.yml
+      - azure-pipelines-ci-cd.yml
+
+pr:
+  branches:
+    include:
+      - dev
+  paths:
+    exclude:
+      - docs/*
+      - README.md
+
+variables:
+  BuildConfiguration: 'release'
+  Prefix: 'fayazkhan'
+  ResourceGroupLocation: 'West Europe'
+  SonarCloudService: 'SonarCloud'
+  AzureSubscription: 'Microsoft Azure Sponsorship (5a56fb34-f1c5-4669-9412-4592bb81a2cf)'
+
+stages:
+# Stage: Build Stage
+- stage: Build_Stage
+  displayName: Build Stage
+  jobs:
+  - job: Build_WebApp
+    displayName: Build Web App
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: Restore Dependencies
+      inputs:
+        command: restore
+        projects: '**/WebApp.csproj'
+
+    - powershell: |
+        Write-Host "Adding Project GUIDs to .csproj files"
+        $paths = Get-ChildItem -include *.csproj -Recurse
+        foreach ($path in $paths) {
+            $doc = New-Object System.Xml.XmlDocument
+            $doc.Load($path.FullName)
+            if (-not $doc.SelectSingleNode("//Project/PropertyGroup/ProjectGuid")) {
+                $guid = [guid]::NewGuid().ToString().ToUpper()
+                Write-Host "Adding GUID: $guid to $path"
+                $child = $doc.CreateElement("ProjectGuid")
+                $child.InnerText = $guid
+                $node = $doc.SelectSingleNode("//Project/PropertyGroup")
+                $node.AppendChild($child)
+                $doc.Save($path.FullName)
+            }
+        }
+      displayName: 'Add Project GUIDs'
+
+    - task: DotNetCoreCLI@2
+      displayName: Build Solution
+      inputs:
+        command: build
+        projects: '**/WebApp.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+
+    - task: DotNetCoreCLI@2
+      displayName: Run Unit Tests
+      inputs:
+        command: test
+        projects: '**/*UnitTest*.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Build Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'WebAppBuild'
+
+  - job: Build_Database
+    displayName: Build Database Job
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+    - task: MSBuild@1
+      displayName: Build Database Solution
+      inputs:
+        solution: 'WebApp.Database/WebApp.Database.sqlproj'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Database Artifact
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'Database'
+
+  - job: Build_Selenium
+    displayName: Build Selenium Tests
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+    - task: NuGetCommand@2
+      displayName: Restore NuGet Packages
+      inputs:
+        restoreSolution: 'WebAppWithDatabase.sln'
+
+    - task: MSBuild@1
+      displayName: Build Selenium Tests
+      inputs:
+        solution: 'SeleniumUiTests/SeleniumUiTests.csproj'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Selenium Test Artifacts
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'SeleniumTests'
+
+  - job: Build_Infra
+    displayName: Publish Infra Files
+    pool:
+      vmImage: 'ubuntu-16.04'
+    steps:
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Terraform Files
+      inputs:
+        PathtoPublish: 'Terraform'
+        ArtifactName: 'Terraform'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish ARM Templates
+      inputs:
+        PathtoPublish: 'AzureResourceGroupDeployment'
+        ArtifactName: 'ARMTemplates'
+
+# Stage: Dev Stage
+- stage: Dev_Stage
+  displayName: Dev Stage
+  dependsOn: Build_Stage
+  jobs:
+  - job: Deploy_Dev
+    displayName: Deploy to Dev Environment
+    pool:
+      vmImage: 'windows-2019'
+    variables:
+      EnvironmentName: 'dev'
+      ResourceGroupName: '$(Prefix)-dev-$(Build.BuildId)-RG'
+    steps:
+    - task: TerraformInstaller@0
+      displayName: Install Terraform
+
+    - task: Terraform@2
+      displayName: Initialize Terraform
+      inputs:
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Terraform'
+
+    - task: Terraform@2
+      displayName: Apply Terraform
+      inputs:
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Terraform'
+        commandOptions: '-auto-approve'
+
+    - task: AzureRmWebAppDeployment@4
+      displayName: Deploy Web App
+      inputs:
+        azureSubscription: '$(AzureSubscription)'
+        appType: 'webApp'
+        WebAppName: '$(Prefix)-dev-$(Build.BuildId)'
+        packageForLinux: '$(Build.ArtifactStagingDirectory)/WebAppBuild/WebApp.zip'
+
+# Stage: Test Stage
+- stage: Test_Stage
+  displayName: Test Stage
+  dependsOn: Dev_Stage
+  jobs:
+  - job: Deploy_Test
+    displayName: Deploy to Test Environment
+    pool:
+      vmImage: 'windows-2019'
+    variables:
+      EnvironmentName: 'test'
+      ResourceGroupName: '$(Prefix)-test-$(Build.BuildId)-RG'
+    steps:
+    - task: TerraformInstaller@0
+      displayName: Install Terraform
+
+    - task: Terraform@2
+      displayName: Initialize Terraform
+      inputs:
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Terraform'
+
+    - task: Terraform@2
+      displayName: Apply Terraform
+      inputs:
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Terraform'
+        commandOptions: '-auto-approve'
+
+    - task: AzureRmWebAppDeployment@4
+      displayName: Deploy Web App
+      inputs:
+        azureSubscription: '$(AzureSubscription)'
+        appType: 'webApp'
+        WebAppName: '$(Prefix)-test-$(Build.BuildId)'
+        packageForLinux: '$(Build.ArtifactStagingDirectory)/WebAppBuild/WebApp.zip'
+
+# Stage: Prod Stage
+- stage: Prod_Stage
+  displayName: Prod Stage
+  dependsOn: Test_Stage
+  jobs:
+  - job: Deploy_Prod
+    displayName: Deploy to Production Environment
+    pool:
+      vmImage: 'windows-2019'
+    variables:
+      EnvironmentName: 'prod'
+      ResourceGroupName: '$(Prefix)-prod-$(Build.BuildId)-RG'
+    steps:
+    - task: TerraformInstaller@0
+      displayName: Install Terraform
+
+    - task: Terraform@2
+      displayName: Initialize Terraform
+      inputs:
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Terraform'
+
+    - task: Terraform@2
+      displayName: Apply Terraform
+      inputs:
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Terraform'
+        commandOptions: '-auto-approve'
+
+    - task: AzureRmWebAppDeployment@4
+      displayName: Deploy Web App
+      inputs:
+        azureSubscription: '$(AzureSubscription)'
+        appType: 'webApp'
+        WebAppName: '$(Prefix)-prod-$(Build.BuildId)'
+        packageForLinux: '$(Build.ArtifactStagingDirectory)/WebAppBuild/WebApp.zip'
